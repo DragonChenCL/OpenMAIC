@@ -156,9 +156,9 @@ jobs:
           Copy-Item (Join-Path $source '.next/standalone/*') $runtime -Recurse -Force
           New-Item -ItemType Directory -Path (Join-Path $runtime '.next/static') -Force | Out-Null
           Copy-Item (Join-Path $source '.next/static/*') (Join-Path $runtime '.next/static') -Recurse -Force
-          $swcHelpersSource = Join-Path $source 'node_modules/next/node_modules/@swc/helpers'
+          $swcHelpersSource = (& node -e 'const fs=require("node:fs");const path=require("node:path");const nextPkg=require.resolve("next/package.json");const entry=require.resolve("@swc/helpers/_/_interop_require_default",{paths:[path.dirname(nextPkg)]});process.stdout.write(path.dirname(path.dirname(fs.realpathSync(entry))))').Trim()
           $swcHelpersDestination = Join-Path $runtime 'node_modules/@swc/helpers'
-          if (-not (Test-Path (Join-Path $swcHelpersSource '_/_interop_require_default.js'))) { throw "Next.js @swc/helpers package entry missing: $swcHelpersSource" }
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $swcHelpersSource '_/_interop_require_default.js'))) { throw "Could not resolve Next.js runtime @swc/helpers package: $swcHelpersSource" }
           New-Item -ItemType Directory -Path (Split-Path $swcHelpersDestination -Parent) -Force | Out-Null
           & node -e "require('node:fs').cpSync(process.argv[1],process.argv[2],{recursive:true,dereference:true})" $swcHelpersSource $swcHelpersDestination
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $swcHelpersDestination '_/_interop_require_default.js'))) { throw 'Could not bundle required @swc/helpers runtime files.' }
