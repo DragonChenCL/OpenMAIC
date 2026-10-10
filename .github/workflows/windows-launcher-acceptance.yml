@@ -1,0 +1,439 @@
+name: Windows Launcher Acceptance
+
+on:
+  push:
+    branches: [product/**]
+    paths:
+      - '.github/workflows/windows-launcher-acceptance.yml'
+      - 'app/**'
+      - 'assets/**'
+      - 'components/**'
+      - 'configs/**'
+      - 'e2e/**'
+      - 'lib/**'
+      - 'packages/**'
+      - 'public/**'
+      - 'scripts/**'
+      - 'skills/**'
+      - 'tests/**'
+      - 'eval/**'
+      - 'launcher/**'
+      - 'LICENSE'
+      - 'LICENSES.md'
+      - '.nvmrc'
+      - 'instrumentation.ts'
+      - 'middleware.ts'
+      - 'next.config.ts'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'tsconfig*.json'
+  pull_request:
+    branches: [product/**]
+    paths:
+      - '.github/workflows/windows-launcher-acceptance.yml'
+      - 'app/**'
+      - 'assets/**'
+      - 'components/**'
+      - 'configs/**'
+      - 'e2e/**'
+      - 'lib/**'
+      - 'packages/**'
+      - 'public/**'
+      - 'scripts/**'
+      - 'skills/**'
+      - 'tests/**'
+      - 'eval/**'
+      - 'launcher/**'
+      - 'LICENSE'
+      - 'LICENSES.md'
+      - '.nvmrc'
+      - 'instrumentation.ts'
+      - 'middleware.ts'
+      - 'next.config.ts'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'tsconfig*.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-launcher-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-acceptance:
+    name: Build and smoke-test Windows x64 launcher
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Verify pinned source and runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Get-Content 'package.json' -Raw | ConvertFrom-Json
+          if ($package.version -ne '1.1.2') { throw "Expected pinned OpenMAIC 1.1.2; found $($package.version)." }
+          if ($package.license -ne 'MIT') { throw "Expected root MIT license; found $($package.license)." }
+          if ($package.engines.node -notmatch '22') { throw "Unexpected Node engine: $($package.engines.node)" }
+          if ((Get-Content '.nvmrc' -Raw).Trim() -ne '22') { throw 'Expected project Node major to remain 22.' }
+          if (-not (Test-Path 'pnpm-lock.yaml')) { throw 'Pinned pnpm lockfile is missing.' }
+          if (-not (Test-Path 'LICENSE')) { throw 'Upstream license is missing.' }
+          $lock = Get-Content 'pnpm-lock.yaml' -Raw
+          if ($lock -notmatch 'lockfileVersion:') { throw 'pnpm lockfile version header is missing.' }
+          if ($package.packageManager -notmatch '^pnpm@10\.28\.0') { throw "Unexpected package manager pin: $($package.packageManager)" }
+          Write-Host "OpenMAIC $($package.version), Node $($package.engines.node), package manager $($package.packageManager); root checkout."
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10.28.0
+
+      - name: Install locked dependencies
+        id: install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build standalone web application
+        id: build-app
+        run: pnpm build
+
+      - name: Verify standalone build output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @('.next/standalone/server.js','.next/standalone/node_modules','.next/static','packages/mathml2omml/LICENSE')) {
+            if (-not (Test-Path $path)) { throw "Build output/required notice missing: $path" }
+          }
+          $standaloneFiles = Get-ChildItem '.next/standalone' -Recurse -File
+          $totalBytes = ($standaloneFiles | Measure-Object -Property Length -Sum).Sum
+          if ($totalBytes -lt 100000000) { throw "Standalone output looks too small ($totalBytes bytes); expected production dependencies/assets." }
+          $nativeModules = @($standaloneFiles | Where-Object { $_.Name -match '\.node$' })
+          if (-not $nativeModules) { throw 'Standalone output contains no native .node modules.' }
+          if (-not ($nativeModules | Where-Object { $_.FullName -match 'sharp' })) { throw 'Standalone output is missing sharp native bindings.' }
+          if (-not ($nativeModules | Where-Object { $_.FullName -match 'canvas' })) { throw 'Standalone output is missing canvas native bindings.' }
+          Write-Host "Standalone bundle: $($standaloneFiles.Count) files, $totalBytes bytes, $($nativeModules.Count) native modules."
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.2'
+          cache-dependency-path: launcher/go.sum
+
+      - name: Run native Windows launcher tests
+        id: native-tests
+        working-directory: launcher
+        run: go test -v ./...
+
+      - name: Compile launcher GUI executable
+        id: compile-launcher
+        working-directory: launcher
+        run: |
+          New-Item -ItemType Directory -Path ../dist -Force | Out-Null
+          go build -trimpath -ldflags='-H windowsgui -s -w' -o ../dist/OpenMAIC-Launcher.exe .
+
+      - name: Assemble isolated portable acceptance folder
+        id: assemble
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = $PWD.Path
+          $out = Join-Path $PWD 'dist/OpenMAIC-Windows-x64'
+          if (Test-Path $out) { Remove-Item $out -Recurse -Force }
+          New-Item -ItemType Directory -Path $out | Out-Null
+          $runtime = Join-Path $out 'runtime'
+          New-Item -ItemType Directory -Path $runtime | Out-Null
+          Copy-Item (Join-Path $source '.next/standalone/*') $runtime -Recurse -Force
+          New-Item -ItemType Directory -Path (Join-Path $runtime '.next/static') -Force | Out-Null
+          Copy-Item (Join-Path $source '.next/static/*') (Join-Path $runtime '.next/static') -Recurse -Force
+          if (Test-Path (Join-Path $source 'public')) {
+            Copy-Item (Join-Path $source 'public') $runtime -Recurse -Force
+          }
+          $node = Get-Command node -ErrorAction Stop
+          $nodeDestination = Join-Path $runtime 'node.exe'
+          Copy-Item $node.Source $nodeDestination -Force
+          $nodeVersion = (& $nodeDestination --version).Trim()
+          if ($nodeVersion -notmatch '^v22\.') { throw "Expected bundled Node 22 runtime, got $nodeVersion." }
+          Copy-Item (Join-Path $PWD 'dist/OpenMAIC-Launcher.exe') $out -Force
+          Copy-Item 'LICENSE' (Join-Path $out 'OPENMAIC-MIT-LICENSE.txt') -Force
+          Copy-Item (Join-Path $PWD 'launcher/OPENMAIC-LICENSE.txt') (Join-Path $out 'OPENMAIC-LAUNCHER-LICENSE.txt') -Force
+          Copy-Item 'LICENSES.md' $out -Force
+          if (-not (Test-Path (Join-Path $source 'packages/mathml2omml/LICENSE'))) { throw 'LGPL package license missing from source.' }
+          Copy-Item (Join-Path $source 'packages/mathml2omml/LICENSE') (Join-Path $out 'mathml2omml-LICENSE-LGPL-3.0-or-later.txt') -Force
+          $manifest = [ordered]@{
+            product = 'OpenMAIC'
+            upstreamVersion = '1.1.2'
+            sourceCommit = '${{ github.sha }}'
+            architecture = 'x64'
+            artifactType = 'portable Windows acceptance bundle'
+            signaturePresent = $false
+            installerPresent = $false
+            nativeWindowsLauncherStartTest = 'pending'
+            bundledServerHealthTest = 'pending'
+            screenshotCaptured = $false
+          }
+          $manifest | ConvertTo-Json | Set-Content (Join-Path $out 'build-manifest.json') -Encoding UTF8
+          @'
+          OpenMAIC Windows x64 acceptance build — NOT A COMMERCIAL RELEASE
+
+          This is an automated CI acceptance artifact, not a signed installer or release package.
+          The GitHub Actions run verifies the bundle on a disposable Windows runner. No API key is included.
+          OpenMAIC source/version and third-party license notices are in the runtime folder and accompanying notice.
+          '@ | Set-Content (Join-Path $out 'README-Windows.txt') -Encoding UTF8
+          if (-not (Test-Path (Join-Path $runtime 'node.exe'))) { throw 'Bundled node.exe missing.' }
+          if (-not (Test-Path (Join-Path $runtime 'server.js'))) { throw 'Standalone server.js missing.' }
+          if (-not (Test-Path (Join-Path $runtime '.next/static'))) { throw 'Next.js static assets missing.' }
+          if (-not (Test-Path (Join-Path $out 'mathml2omml-LICENSE-LGPL-3.0-or-later.txt'))) { throw 'Bundled LGPL license missing.' }
+          $assetManifestPath = Join-Path $runtime '.next/required-server-files.json'
+          $assetManifest = Get-Content $assetManifestPath -Raw | ConvertFrom-Json
+          if ($assetManifest.config.output -ne 'standalone') { throw "Build is not Next.js standalone output: $($assetManifest.config.output)" }
+          $repoRuntimePackages = Get-ChildItem '.next/standalone/node_modules/@openmaic' -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+          foreach ($packageName in @('dsl','editor','generation','importer','renderer','storage')) {
+            if ($packageName -notin $repoRuntimePackages) { throw "Standalone runtime misses workspace package @openmaic/$packageName." }
+          }
+          Get-ChildItem $out | Select-Object Name,Length
+
+      - name: Run launcher native GUI startup smoke test
+        id: gui-smoke
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundle = Join-Path $PWD 'dist/OpenMAIC-Windows-x64'
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'openmaic-launcher-smoke-data'
+          New-Item -ItemType Directory -Path $env:LOCALAPPDATA -Force | Out-Null
+          $oldLocation = Get-Location
+          $launcher = $null
+          try {
+            Set-Location $env:RUNNER_TEMP
+            Remove-Item Env:DEEPSEEK_API_KEY -ErrorAction SilentlyContinue
+            $launcher = Start-Process -FilePath (Join-Path $bundle 'OpenMAIC-Launcher.exe') -PassThru
+            try {
+              $windowWait = [Diagnostics.Stopwatch]::StartNew()
+              $observedHwnd = [IntPtr]::Zero
+              while ($windowWait.Elapsed.TotalSeconds -lt 15 -and $observedHwnd -eq [IntPtr]::Zero) {
+                $launcher.Refresh()
+                if ($launcher.HasExited) { throw "Launcher exited during startup (exit code $($launcher.ExitCode))." }
+                foreach ($process in Get-Process -Id $launcher.Id -ErrorAction SilentlyContinue) {
+                  if ($process.MainWindowHandle -ne [IntPtr]::Zero) { $observedHwnd = $process.MainWindowHandle; break }
+                }
+                if ($observedHwnd -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 250 }
+              }
+              if ($observedHwnd -eq [IntPtr]::Zero) { throw 'Launcher did not create a visible top-level window within 15 seconds.' }
+              Write-Host "Native launcher window created. PID=$($launcher.Id); HWND=$observedHwnd."
+              $manifestPath = Join-Path $bundle 'build-manifest.json'
+              $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+              $manifest.nativeWindowsLauncherStartTest = 'passed'
+              $manifest | ConvertTo-Json | Set-Content $manifestPath -Encoding UTF8
+            } finally {
+              $launcher.Refresh()
+              if (-not $launcher.HasExited) { Stop-Process -Id $launcher.Id -Force; $launcher.WaitForExit() }
+            }
+          } finally {
+            Set-Location $oldLocation
+          }
+
+      - name: Run bundled server, check health/homepage, and save HTML
+        id: server-smoke
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundle = Join-Path $PWD 'dist/OpenMAIC-Windows-x64'
+          $runtime = Join-Path $bundle 'runtime'
+          $port = 31847
+          $env:NODE_ENV = 'production'
+          $env:HOSTNAME = '127.0.0.1'
+          $env:PORT = "$port"
+          $env:DEFAULT_MODEL = 'deepseek:deepseek-v4-flash'
+          # Deliberately no model API key: test only routes that do not invoke providers.
+          Remove-Item Env:DEEPSEEK_API_KEY -ErrorAction SilentlyContinue
+          $stdout = Join-Path $env:RUNNER_TEMP 'openmaic-windows-acceptance.stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'openmaic-windows-acceptance.stderr.log'
+          $server = Start-Process -FilePath (Join-Path $runtime 'node.exe') -ArgumentList 'server.js' -WorkingDirectory $runtime -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          try {
+            $health = $null
+            for ($attempt = 0; $attempt -lt 90; $attempt++) {
+              if ($server.HasExited) { throw "Bundled OpenMAIC exited with $($server.ExitCode). See $stdout and $stderr." }
+              try {
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/health" -TimeoutSec 3
+                if ($health.status -eq 'ok') { break }
+              } catch { Start-Sleep -Seconds 2 }
+            }
+            if (-not $health -or $health.status -ne 'ok') {
+              if (Test-Path $stdout) { Get-Content $stdout -Tail 80 }
+              if (Test-Path $stderr) { Get-Content $stderr -Tail 80 }
+              throw 'Health endpoint did not return status=ok.'
+            }
+            $home = Invoke-WebRequest -Uri "http://127.0.0.1:$port/" -TimeoutSec 30
+            if ($home.StatusCode -ne 200) { throw "Home route HTTP $($home.StatusCode)." }
+            $html = [string]$home.Content
+            if ($html.Length -lt 1000) { throw "Home route returned suspiciously short HTML ($($html.Length) chars)." }
+            Write-Host "Health status: $($health.status); app version: $($health.version); homepage: HTTP $($home.StatusCode), $($html.Length) chars."
+            $home.Content | Set-Content (Join-Path $PWD 'dist/openmaic-homepage.html') -Encoding UTF8
+            $cssLinks = [regex]::Matches($html, '/_next/static/[^"''\s>]+\.css') | ForEach-Object { $_.Value } | Select-Object -Unique
+            if (-not $cssLinks) { throw 'Homepage contains no local CSS links.' }
+            foreach ($asset in $cssLinks) {
+              $response = Invoke-WebRequest -Uri "http://127.0.0.1:$port$asset" -TimeoutSec 20
+              if ($response.StatusCode -ne 200) { throw "Static CSS asset failed: $asset HTTP $($response.StatusCode)." }
+            }
+            Write-Host "Verified $($cssLinks.Count) local CSS asset(s)."
+          } finally {
+            if ($server -and -not $server.HasExited) { Stop-Process -Id $server.Id -Force; $server.WaitForExit() }
+            if (Test-Path $stdout) { Write-Host '=== server stdout ==='; Get-Content $stdout -Tail 40 }
+            if (Test-Path $stderr) { Write-Host '=== server stderr ==='; Get-Content $stderr -Tail 40 }
+          }
+
+      - name: Capture real product UI screenshot on Windows
+        id: screenshot
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundle = Join-Path $PWD 'dist/OpenMAIC-Windows-x64'
+          $runtime = Join-Path $bundle 'runtime'
+          $port = 31847
+          $env:NODE_ENV = 'production'
+          $env:HOSTNAME = '127.0.0.1'
+          $env:PORT = "$port"
+          Remove-Item Env:DEEPSEEK_API_KEY -ErrorAction SilentlyContinue
+          $stdout = Join-Path $env:RUNNER_TEMP 'openmaic-screenshot.stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'openmaic-screenshot.stderr.log'
+          $server = Start-Process -FilePath (Join-Path $runtime 'node.exe') -ArgumentList 'server.js' -WorkingDirectory $runtime -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          try {
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 90; $attempt++) {
+              if ($server.HasExited) { throw "OpenMAIC exited before screenshot. See $stdout and $stderr." }
+              try { if ((Invoke-RestMethod "http://127.0.0.1:$port/api/health" -TimeoutSec 3).status -eq 'ok') { $ready = $true; break } } catch { Start-Sleep -Seconds 2 }
+            }
+            if (-not $ready) { throw 'OpenMAIC did not become healthy before screenshot.' }
+            $browserPath = 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
+            if (-not (Test-Path $browserPath)) { $browserPath = 'C:\Program Files\Microsoft\Edge\Application\msedge.exe' }
+            if (-not (Test-Path $browserPath)) { throw 'Microsoft Edge executable is not available on the runner.' }
+            $screenshot = Join-Path $PWD 'dist/openmaic-ui-windows.png'
+            & $browserPath --headless --disable-gpu --no-first-run --hide-scrollbars --virtual-time-budget=5000 --window-size=1440,1000 --screenshot="$screenshot" "http://127.0.0.1:$port/"
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $screenshot)) { throw 'Headless browser screenshot capture failed.' }
+            if ((Get-Item $screenshot).Length -lt 20000) { throw 'Screenshot is unexpectedly small.' }
+            Add-Type -AssemblyName System.Drawing
+            $image = [System.Drawing.Image]::FromFile($screenshot)
+            try {
+              if ($image.Width -lt 1000 -or $image.Height -lt 700) { throw "Screenshot dimensions are too small: $($image.Width)x$($image.Height)." }
+            } finally { $image.Dispose() }
+            $manifestPath = Join-Path $bundle 'build-manifest.json'
+            $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+            $manifest.bundledServerHealthTest = 'passed'
+            $manifest.screenshotCaptured = $true
+            $manifest | ConvertTo-Json | Set-Content $manifestPath -Encoding UTF8
+            Write-Host "Captured real OpenMAIC UI screenshot: $screenshot ($((Get-Item $screenshot).Length) bytes)."
+          } finally {
+            if ($server -and -not $server.HasExited) { Stop-Process -Id $server.Id -Force; $server.WaitForExit() }
+            if (Test-Path $stdout) { Get-Content $stdout -Tail 40 }
+            if (Test-Path $stderr) { Get-Content $stderr -Tail 40 }
+          }
+
+      - name: Package exact acceptance bundle
+        id: package-bundle
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $PWD 'dist/OpenMAIC-Windows-x64-acceptance.zip'
+          Compress-Archive -Path (Join-Path $PWD 'dist/OpenMAIC-Windows-x64') -DestinationPath $archive -CompressionLevel Optimal -Force
+          Get-FileHash -Algorithm SHA256 $archive | Format-List
+          $listing = tar -tf $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list final acceptance archive.' }
+          $extract = Join-Path $env:RUNNER_TEMP 'openmaic-archive-recheck'
+          if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
+          New-Item -ItemType Directory -Path $extract | Out-Null
+          tar -xf $archive -C $extract
+          if ($LASTEXITCODE -ne 0) { throw 'Could not extract final acceptance archive.' }
+          $payload = Join-Path $extract 'OpenMAIC-Windows-x64'
+          foreach ($required in @('OpenMAIC-Launcher.exe','runtime/node.exe','runtime/server.js','runtime/.next/static','mathml2omml-LICENSE-LGPL-3.0-or-later.txt','OPENMAIC-MIT-LICENSE.txt','OPENMAIC-LAUNCHER-LICENSE.txt','LICENSES.md','README-Windows.txt','build-manifest.json')) {
+            if (-not (Test-Path (Join-Path $payload $required))) { throw "Exact archive is missing: $required" }
+          }
+          $manifest = Get-Content (Join-Path $payload 'build-manifest.json') -Raw | ConvertFrom-Json
+          if ($manifest.nativeWindowsLauncherStartTest -ne 'passed' -or $manifest.bundledServerHealthTest -ne 'passed' -or -not $manifest.screenshotCaptured) {
+            throw 'Acceptance evidence in exact final archive is incomplete.'
+          }
+          if (-not ($listing -match 'runtime/node.exe') -or -not ($listing -match 'runtime/server.js') -or -not ($listing -match 'OpenMAIC-Launcher.exe')) {
+            throw 'Final archive is missing a required entry point.'
+          }
+          if ($listing -match '\.env\.local|deepseek-key\.dpapi|openmaic\.log') { throw 'Final archive includes local secrets or runtime data.' }
+          Write-Host "Extracted and inspected exact archive: $archive"
+
+      - name: Write machine-readable acceptance result
+        if: always()
+        env:
+          DEPENDENCIES: ${{ steps.install.outcome }}
+          APP_BUILD: ${{ steps.build-app.outcome }}
+          NATIVE_TESTS: ${{ steps.native-tests.outcome }}
+          LAUNCHER_COMPILE: ${{ steps.compile-launcher.outcome }}
+          BUNDLE_ASSEMBLY: ${{ steps.assemble.outcome }}
+          GUI_SMOKE: ${{ steps.gui-smoke.outcome }}
+          SERVER_SMOKE: ${{ steps.server-smoke.outcome }}
+          SCREENSHOT: ${{ steps.screenshot.outcome }}
+          PACKAGE: ${{ steps.package-bundle.outcome }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $outDir = Join-Path $PWD 'dist'
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+          $result = [ordered]@{
+            product = 'OpenMAIC'
+            sourceCommit = '${{ github.sha }}'
+            workflowRunId = '${{ github.run_id }}'
+            runner = 'windows-latest'
+            outcomes = [ordered]@{
+              lockedDependencies = $env:DEPENDENCIES
+              applicationBuild = $env:APP_BUILD
+              nativeWindowsTests = $env:NATIVE_TESTS
+              launcherCompile = $env:LAUNCHER_COMPILE
+              bundleAssembly = $env:BUNDLE_ASSEMBLY
+              nativeGuiStartup = $env:GUI_SMOKE
+              bundledServerSmoke = $env:SERVER_SMOKE
+              realUiScreenshot = $env:SCREENSHOT
+              archiveInspection = $env:PACKAGE
+            }
+            manifest = $null
+            screenshot = $null
+            archive = $null
+            generatedAtUtc = [DateTime]::UtcNow.ToString('o')
+          }
+          $manifestPath = Join-Path $outDir 'OpenMAIC-Windows-x64/build-manifest.json'
+          if (Test-Path $manifestPath) { $result.manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json }
+          $screenshotPath = Join-Path $outDir 'openmaic-ui-windows.png'
+          if (Test-Path $screenshotPath) {
+            $screenshotHash = Get-FileHash -Algorithm SHA256 $screenshotPath
+            Add-Type -AssemblyName System.Drawing
+            $image = [System.Drawing.Image]::FromFile($screenshotPath)
+            try { $dimensions = "{0}x{1}" -f $image.Width,$image.Height } finally { $image.Dispose() }
+            $result.screenshot = [ordered]@{ path = 'openmaic-ui-windows.png'; bytes = (Get-Item $screenshotPath).Length; sha256 = $screenshotHash.Hash; dimensions = $dimensions }
+          }
+          $archivePath = Join-Path $outDir 'OpenMAIC-Windows-x64-acceptance.zip'
+          if (Test-Path $archivePath) {
+            $archiveHash = Get-FileHash -Algorithm SHA256 $archivePath
+            $result.archive = [ordered]@{ path = 'OpenMAIC-Windows-x64-acceptance.zip'; bytes = (Get-Item $archivePath).Length; sha256 = $archiveHash.Hash }
+          }
+          $result | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $outDir 'acceptance-result.json') -Encoding UTF8
+          Get-Content (Join-Path $outDir 'acceptance-result.json')
+
+      - name: Upload tested Windows acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: openmaic-windows-acceptance-${{ github.run_id }}
+          path: |
+            dist/OpenMAIC-Windows-x64-acceptance.zip
+            dist/openmaic-ui-windows.png
+            dist/openmaic-homepage.html
+            dist/acceptance-result.json
+            dist/OpenMAIC-Windows-x64/build-manifest.json
+            ${{ runner.temp }}/openmaic-windows-acceptance.stdout.log
+            ${{ runner.temp }}/openmaic-windows-acceptance.stderr.log
+            ${{ runner.temp }}/openmaic-screenshot.stdout.log
+            ${{ runner.temp }}/openmaic-screenshot.stderr.log
+          if-no-files-found: warn
+          retention-days: 14
