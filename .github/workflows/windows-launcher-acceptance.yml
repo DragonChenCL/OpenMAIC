@@ -156,9 +156,9 @@ jobs:
           Copy-Item (Join-Path $source '.next/standalone/*') $runtime -Recurse -Force
           New-Item -ItemType Directory -Path (Join-Path $runtime '.next/static') -Force | Out-Null
           Copy-Item (Join-Path $source '.next/static/*') (Join-Path $runtime '.next/static') -Recurse -Force
-          $swcHelpersSource = Join-Path $source 'node_modules/.pnpm/@swc+helpers@0.5.23/node_modules/@swc/helpers'
+          $swcHelpersSource = Join-Path $source 'node_modules/next/node_modules/@swc/helpers'
           $swcHelpersDestination = Join-Path $runtime 'node_modules/@swc/helpers'
-          if (-not (Test-Path (Join-Path $swcHelpersSource '_/_interop_require_default.js'))) { throw "Locked @swc/helpers package not found at expected pnpm path: $swcHelpersSource" }
+          if (-not (Test-Path (Join-Path $swcHelpersSource '_/_interop_require_default.js'))) { throw "Next.js @swc/helpers package entry missing: $swcHelpersSource" }
           New-Item -ItemType Directory -Path (Split-Path $swcHelpersDestination -Parent) -Force | Out-Null
           & node -e "require('node:fs').cpSync(process.argv[1],process.argv[2],{recursive:true,dereference:true})" $swcHelpersSource $swcHelpersDestination
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $swcHelpersDestination '_/_interop_require_default.js'))) { throw 'Could not bundle required @swc/helpers runtime files.' }
