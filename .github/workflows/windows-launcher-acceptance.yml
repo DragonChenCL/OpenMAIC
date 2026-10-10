@@ -201,7 +201,7 @@ jobs:
             $packageJson = Join-Path $source "packages/@openmaic/$packageName/package.json"
             if (-not (Test-Path $packageJson)) { throw "Workspace source package missing: @openmaic/$packageName" }
             $package = Get-Content $packageJson -Raw | ConvertFrom-Json
-            if ($package.name -ne "@openmaic/$packageName") { throw "Unexpected package identity in $packageJson: $($package.name)" }
+            if ($package.name -ne "@openmaic/$packageName") { throw "Unexpected package identity in ${packageJson}: $($package.name)" }
           }
           Get-ChildItem $out | Select-Object Name,Length
 
