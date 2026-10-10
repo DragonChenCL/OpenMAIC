@@ -197,9 +197,11 @@ jobs:
           $assetManifestPath = Join-Path $runtime '.next/required-server-files.json'
           $assetManifest = Get-Content $assetManifestPath -Raw | ConvertFrom-Json
           if ($assetManifest.config.output -ne 'standalone') { throw "Build is not Next.js standalone output: $($assetManifest.config.output)" }
-          $repoRuntimePackages = Get-ChildItem '.next/standalone/node_modules/@openmaic' -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
           foreach ($packageName in @('dsl','editor','generation','importer','renderer','storage')) {
-            if ($packageName -notin $repoRuntimePackages) { throw "Standalone runtime misses workspace package @openmaic/$packageName." }
+            $packageJson = Join-Path $source "packages/@openmaic/$packageName/package.json"
+            if (-not (Test-Path $packageJson)) { throw "Workspace source package missing: @openmaic/$packageName" }
+            $package = Get-Content $packageJson -Raw | ConvertFrom-Json
+            if ($package.name -ne "@openmaic/$packageName") { throw "Unexpected package identity in $packageJson: $($package.name)" }
           }
           Get-ChildItem $out | Select-Object Name,Length
 
