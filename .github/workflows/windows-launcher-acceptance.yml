@@ -206,6 +206,80 @@ jobs:
           $dependencyReport = $nextDependencyScript | & node - $source $runtime
           if ($LASTEXITCODE -ne 0) { throw 'Could not restore missing direct Next.js runtime dependencies.' }
           Write-Host $dependencyReport
+          $externalDependencyScript = @'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { createRequire } = require('node:module');
+          const [source, runtime] = process.argv.slice(2);
+          const findPackageRoot = (entry, expectedName) => {
+            let current = path.dirname(fs.realpathSync(entry));
+            while (true) {
+              const manifest = path.join(current, 'package.json');
+              if (fs.existsSync(manifest)) {
+                try { if (JSON.parse(fs.readFileSync(manifest, 'utf8')).name === expectedName) return current; } catch {}
+              }
+              const parent = path.dirname(current);
+              if (parent === current) break;
+              current = parent;
+            }
+            throw new Error(`Could not find package root for ${expectedName} from ${entry}`);
+          };
+          const runtimeRoot = path.join(runtime, '.next/node_modules');
+          const queue = [];
+          const discover = (directory) => {
+            if (!fs.existsSync(directory)) return;
+            for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+              if (!entry.isDirectory()) continue;
+              const candidate = path.join(directory, entry.name);
+              const manifest = path.join(candidate, 'package.json');
+              if (fs.existsSync(manifest)) {
+                const pkg = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+                if (pkg.name) queue.push({ name: pkg.name, runtimeRoot: candidate });
+              } else if (entry.name.startsWith('@')) discover(candidate);
+            }
+          };
+          discover(runtimeRoot);
+          const visited = new Set();
+          const copied = [];
+          const unresolvedOptional = [];
+          while (queue.length) {
+            const current = queue.shift();
+            const runtimeManifestPath = path.join(current.runtimeRoot, 'package.json');
+            if (!fs.existsSync(runtimeManifestPath)) continue;
+            const runtimePackage = JSON.parse(fs.readFileSync(runtimeManifestPath, 'utf8'));
+            const key = `${runtimePackage.name}@${runtimePackage.version}:${current.runtimeRoot}`;
+            if (visited.has(key)) continue;
+            visited.add(key);
+            let sourceEntry;
+            try { sourceEntry = require.resolve(current.name, { paths: [source] }); }
+            catch (error) { throw new Error(`Standalone external package ${current.name} has no source install: ${error.message}`); }
+            const sourceRoot = findPackageRoot(sourceEntry, current.name);
+            const sourceRequire = createRequire(path.join(sourceRoot, 'package.json'));
+            const runtimeRequire = createRequire(path.join(current.runtimeRoot, 'package.json'));
+            const dependencies = runtimePackage.dependencies || {};
+            const optional = runtimePackage.optionalDependencies || {};
+            for (const [name, isOptional] of [...Object.keys(dependencies).map(name => [name, false]), ...Object.keys(optional).map(name => [name, true])]) {
+              try { runtimeRequire.resolve(name); continue; } catch {}
+              let dependencyEntry;
+              try { dependencyEntry = sourceRequire.resolve(name); }
+              catch (error) {
+                if (isOptional) { unresolvedOptional.push(`${runtimePackage.name} -> ${name}`); continue; }
+                throw new Error(`Runtime package ${runtimePackage.name} is missing dependency ${name}; source resolution failed: ${error.message}`);
+              }
+              const dependencyRoot = findPackageRoot(dependencyEntry, name);
+              const destination = path.join(current.runtimeRoot, 'node_modules', ...name.split('/'));
+              fs.mkdirSync(path.dirname(destination), { recursive: true });
+              fs.cpSync(dependencyRoot, destination, { recursive: true, dereference: true });
+              runtimeRequire.resolve(name);
+              copied.push({ from: runtimePackage.name, dependency: name, version: JSON.parse(fs.readFileSync(path.join(dependencyRoot, 'package.json'), 'utf8')).version });
+              queue.push({ name, runtimeRoot: destination });
+            }
+          }
+          console.log(JSON.stringify({ scannedExternalPackageRoots: visited.size, copiedMissingTransitiveDependencies: copied, unresolvedOptionalDependencies: unresolvedOptional }, null, 2));
+          '@
+          $externalDependencyReport = $externalDependencyScript | & node - $source $runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Could not close the runtime dependency graph for traced external packages.' }
+          Write-Host $externalDependencyReport
           if (Test-Path (Join-Path $source 'public')) {
             Copy-Item (Join-Path $source 'public') $runtime -Recurse -Force
           }
