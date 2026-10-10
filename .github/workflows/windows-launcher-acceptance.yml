@@ -225,14 +225,21 @@ jobs:
             throw new Error(`Could not find package root for ${expectedName} from ${entry}`);
           };
           const resolveSourcePackageRoot = (name, fromRoot) => {
-            const installedPath = path.join(fromRoot, 'node_modules', ...name.split('/'));
+            const packageSegments = name.split('/');
+            const candidates = [path.join(fromRoot, 'node_modules', ...packageSegments)];
             try {
-              if (fs.existsSync(path.join(installedPath, 'package.json'))) {
-                const installedRoot = fs.realpathSync(installedPath);
-                const manifest = JSON.parse(fs.readFileSync(path.join(installedRoot, 'package.json'), 'utf8'));
-                if (manifest.name === name) return installedRoot;
-              }
+              const resolver = createRequire(path.join(fromRoot, 'package.json'));
+              candidates.push(...(resolver.resolve.paths(name) || []).map(nodeModulesPath => path.join(nodeModulesPath, ...packageSegments)));
             } catch {}
+            for (const candidate of [...new Set(candidates)]) {
+              try {
+                const manifestPath = path.join(candidate, 'package.json');
+                if (!fs.existsSync(manifestPath)) continue;
+                const packageRoot = fs.realpathSync(candidate);
+                const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8'));
+                if (manifest.name === name) return packageRoot;
+              } catch {}
+            }
             const entry = require.resolve(name, { paths: [fromRoot] });
             return findPackageRoot(entry, name);
           };
