@@ -224,6 +224,18 @@ jobs:
             }
             throw new Error(`Could not find package root for ${expectedName} from ${entry}`);
           };
+          const resolveSourcePackageRoot = (name, fromRoot) => {
+            const installedPath = path.join(fromRoot, 'node_modules', ...name.split('/'));
+            try {
+              if (fs.existsSync(path.join(installedPath, 'package.json'))) {
+                const installedRoot = fs.realpathSync(installedPath);
+                const manifest = JSON.parse(fs.readFileSync(path.join(installedRoot, 'package.json'), 'utf8'));
+                if (manifest.name === name) return installedRoot;
+              }
+            } catch {}
+            const entry = require.resolve(name, { paths: [fromRoot] });
+            return findPackageRoot(entry, name);
+          };
           const runtimeRoot = path.join(runtime, '.next/node_modules');
           const queue = [];
           const discover = (directory) => {
@@ -250,23 +262,19 @@ jobs:
             const key = `${runtimePackage.name}@${runtimePackage.version}:${current.runtimeRoot}`;
             if (visited.has(key)) continue;
             visited.add(key);
-            let sourceEntry;
-            try { sourceEntry = require.resolve(current.name, { paths: [source] }); }
-            catch (error) { throw new Error(`Standalone external package ${current.name} has no source install: ${error.message}`); }
-            const sourceRoot = findPackageRoot(sourceEntry, current.name);
+            const sourceRoot = resolveSourcePackageRoot(current.name, source);
             const sourceRequire = createRequire(path.join(sourceRoot, 'package.json'));
             const runtimeRequire = createRequire(path.join(current.runtimeRoot, 'package.json'));
             const dependencies = runtimePackage.dependencies || {};
             const optional = runtimePackage.optionalDependencies || {};
             for (const [name, isOptional] of [...Object.keys(dependencies).map(name => [name, false]), ...Object.keys(optional).map(name => [name, true])]) {
               try { runtimeRequire.resolve(name); continue; } catch {}
-              let dependencyEntry;
-              try { dependencyEntry = sourceRequire.resolve(name); }
+              let dependencyRoot;
+              try { dependencyRoot = resolveSourcePackageRoot(name, sourceRoot); }
               catch (error) {
                 if (isOptional) { unresolvedOptional.push(`${runtimePackage.name} -> ${name}`); continue; }
                 throw new Error(`Runtime package ${runtimePackage.name} is missing dependency ${name}; source resolution failed: ${error.message}`);
               }
-              const dependencyRoot = findPackageRoot(dependencyEntry, name);
               const destination = path.join(current.runtimeRoot, 'node_modules', ...name.split('/'));
               fs.mkdirSync(path.dirname(destination), { recursive: true });
               fs.cpSync(dependencyRoot, destination, { recursive: true, dereference: true });
