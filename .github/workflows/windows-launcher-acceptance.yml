@@ -285,7 +285,12 @@ jobs:
               const destination = path.join(current.runtimeRoot, 'node_modules', ...name.split('/'));
               fs.mkdirSync(path.dirname(destination), { recursive: true });
               fs.cpSync(dependencyRoot, destination, { recursive: true, dereference: true });
-              runtimeRequire.resolve(name);
+              try { runtimeRequire.resolve(name); }
+              catch (error) {
+                if (error.code !== 'ERR_PACKAGE_PATH_NOT_EXPORTED') throw error;
+                const installedManifest = path.join(destination, 'package.json');
+                if (!fs.existsSync(installedManifest) || JSON.parse(fs.readFileSync(installedManifest, 'utf8')).name !== name) throw error;
+              }
               copied.push({ from: runtimePackage.name, dependency: name, version: JSON.parse(fs.readFileSync(path.join(dependencyRoot, 'package.json'), 'utf8')).version });
               queue.push({ name, runtimeRoot: destination });
             }
