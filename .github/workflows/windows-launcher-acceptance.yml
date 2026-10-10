@@ -164,7 +164,48 @@ jobs:
           if (-not (Test-Path $swcSourceEntry)) { throw "Resolved Next.js @swc/helpers entry missing: $swcSourceEntry" }
           New-Item -ItemType Directory -Path (Split-Path $swcHelpersDestination -Parent) -Force | Out-Null
           & node -e "require('node:fs').cpSync(process.argv[1],process.argv[2],{recursive:true,dereference:true})" $swcHelpersSource $swcHelpersDestination
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $swcDestinationEntry)) { throw "Could not bundle resolved @swc/helpers entry: $swcDestinationEntry" }
+          $nextDependencyScript = @'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { createRequire } = require('node:module');
+          const [source, runtime] = process.argv.slice(2);
+          const sourceNextManifest = require.resolve('next/package.json', { paths: [source] });
+          const sourceNextRoot = path.dirname(fs.realpathSync(sourceNextManifest));
+          const sourceNextPackage = JSON.parse(fs.readFileSync(sourceNextManifest, 'utf8'));
+          const runtimeNextEntry = path.join(runtime, 'node_modules/next/dist/server/config.js');
+          const runtimeRequire = createRequire(runtimeNextEntry);
+          const copied = [];
+          const findPackageRoot = (entry, expectedName) => {
+            let current = path.dirname(fs.realpathSync(entry));
+            while (true) {
+              const manifest = path.join(current, 'package.json');
+              if (fs.existsSync(manifest)) {
+                try { if (JSON.parse(fs.readFileSync(manifest, 'utf8')).name === expectedName) return current; } catch {}
+              }
+              const parent = path.dirname(current);
+              if (parent === current) break;
+              current = parent;
+            }
+            throw new Error(`Could not find package root for ${expectedName} from ${entry}`);
+          };
+          for (const name of Object.keys(sourceNextPackage.dependencies || {})) {
+            try { runtimeRequire.resolve(name); continue; } catch {}
+            let sourceEntry;
+            try { sourceEntry = require.resolve(name, { paths: [sourceNextRoot] }); }
+            catch (error) { throw new Error(`Next.js declares required dependency ${name}, but source install cannot resolve it: ${error.message}`); }
+            const sourcePackageRoot = findPackageRoot(sourceEntry, name);
+            const destination = path.join(runtime, 'node_modules', ...name.split('/'));
+            fs.rmSync(destination, { recursive: true, force: true });
+            fs.mkdirSync(path.dirname(destination), { recursive: true });
+            fs.cpSync(sourcePackageRoot, destination, { recursive: true, dereference: true });
+            runtimeRequire.resolve(name);
+            copied.push(name);
+          }
+          console.log(JSON.stringify({ nextVersion: sourceNextPackage.version, copiedMissingNextDependencies: copied }, null, 2));
+          '@
+          $dependencyReport = $nextDependencyScript | & node - $source $runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Could not restore missing direct Next.js runtime dependencies.' }
+          Write-Host $dependencyReport
           if (Test-Path (Join-Path $source 'public')) {
             Copy-Item (Join-Path $source 'public') $runtime -Recurse -Force
           }
@@ -229,7 +270,7 @@ jobs:
           const { createRequire } = require('node:module');
           const [repo, standalone, runtime] = process.argv.slice(2);
           const inspect = (label, base) => {
-            const result = { label, base, entries: {}, resolveFromServer: {} };
+            const result = { label, base, entries: {}, resolveFromNextConfig: {}, nextDependencies: {} };
             for (const target of ['server.js', 'node_modules/next/package.json', 'node_modules/@next/env/package.json', 'node_modules/@swc/helpers/package.json', 'node_modules/.pnpm']) {
               const candidate = path.join(base, target);
               try {
@@ -240,14 +281,20 @@ jobs:
                 result.entries[target] = item;
               } catch (e) { result.entries[target] = { exists: false, error: e.code }; }
             }
-            const entry = path.join(base, 'server.js');
+            const nextConfigPath = path.join(base, 'node_modules/next/dist/server/config.js');
             try {
-              const req = createRequire(entry);
-              for (const name of ['next/package.json', '@next/env/package.json', '@swc/helpers/package.json']) {
-                try { const resolved = req.resolve(name); result.resolveFromServer[name] = { resolved, realpath: fs.realpathSync(resolved) }; }
-                catch (e) { result.resolveFromServer[name] = { error: e.code, message: e.message.split('\\n')[0] }; }
+              const req = createRequire(nextConfigPath);
+              for (const name of ['next/package.json', '@next/env', '@swc/helpers']) {
+                try { const resolved = req.resolve(name); result.resolveFromNextConfig[name] = { resolved, realpath: fs.realpathSync(resolved) }; }
+                catch (e) { result.resolveFromNextConfig[name] = { error: e.code, message: e.message.split('\\n')[0] }; }
               }
-            } catch (e) { result.resolveFromServer.error = e.message; }
+              const nextPackagePath = req.resolve('next/package.json');
+              const nextPackage = JSON.parse(fs.readFileSync(nextPackagePath, 'utf8'));
+              for (const name of Object.keys(nextPackage.dependencies || {})) {
+                try { result.nextDependencies[name] = { resolved: req.resolve(name) }; }
+                catch (e) { result.nextDependencies[name] = { error: e.code }; }
+              }
+            } catch (e) { result.resolveFromNextConfig.error = e.message; }
             const pnpmDir = path.join(base, 'node_modules/.pnpm');
             try { result.pnpmNextEnvCandidates = fs.readdirSync(pnpmDir).filter(n => n.startsWith('@next+env@')).slice(0, 10); }
             catch (e) { result.pnpmNextEnvCandidates = { error: e.code }; }
