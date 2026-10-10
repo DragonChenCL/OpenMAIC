@@ -214,6 +214,54 @@ jobs:
           }
           Get-ChildItem $out | Select-Object Name,Length
 
+      - name: Diagnose relocated Next.js runtime dependency closure
+        id: runtime-diagnostics
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runtime = Join-Path $PWD 'dist/OpenMAIC-Windows-x64/runtime'
+          $standalone = Join-Path $PWD '.next/standalone'
+          $repo = $PWD.Path
+          $diagnosticsPath = Join-Path $PWD 'dist/portable-runtime-diagnostics.json'
+          $script = @'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { createRequire } = require('node:module');
+          const [repo, standalone, runtime] = process.argv.slice(2);
+          const inspect = (label, base) => {
+            const result = { label, base, entries: {}, resolveFromServer: {} };
+            for (const target of ['server.js', 'node_modules/next/package.json', 'node_modules/@next/env/package.json', 'node_modules/@swc/helpers/package.json', 'node_modules/.pnpm']) {
+              const candidate = path.join(base, target);
+              try {
+                const st = fs.lstatSync(candidate);
+                const item = { exists: true, type: st.isDirectory() ? 'directory' : st.isSymbolicLink() ? 'symlink' : 'file' };
+                if (st.isSymbolicLink()) item.link = fs.readlinkSync(candidate);
+                try { item.realpath = fs.realpathSync(candidate); } catch (e) { item.realpathError = e.message; }
+                result.entries[target] = item;
+              } catch (e) { result.entries[target] = { exists: false, error: e.code }; }
+            }
+            const entry = path.join(base, 'server.js');
+            try {
+              const req = createRequire(entry);
+              for (const name of ['next/package.json', '@next/env/package.json', '@swc/helpers/package.json']) {
+                try { const resolved = req.resolve(name); result.resolveFromServer[name] = { resolved, realpath: fs.realpathSync(resolved) }; }
+                catch (e) { result.resolveFromServer[name] = { error: e.code, message: e.message.split('\\n')[0] }; }
+              }
+            } catch (e) { result.resolveFromServer.error = e.message; }
+            const pnpmDir = path.join(base, 'node_modules/.pnpm');
+            try { result.pnpmNextEnvCandidates = fs.readdirSync(pnpmDir).filter(n => n.startsWith('@next+env@')).slice(0, 10); }
+            catch (e) { result.pnpmNextEnvCandidates = { error: e.code }; }
+            return result;
+          };
+          const output = { repo: inspect('repository', repo), standalone: inspect('standalone', standalone), relocatedRuntime: inspect('relocated-runtime', runtime) };
+          console.log(JSON.stringify(output, null, 2));
+          '@
+          New-Item -ItemType Directory -Path (Split-Path $diagnosticsPath -Parent) -Force | Out-Null
+          $json = $script | & node - $repo $standalone $runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime dependency diagnostics failed.' }
+          $json | Set-Content $diagnosticsPath -Encoding UTF8
+          Write-Host "Saved relocated runtime dependency diagnostics: $diagnosticsPath"
+
       - name: Run launcher native GUI startup smoke test
         id: gui-smoke
         run: |
@@ -440,6 +488,7 @@ jobs:
             dist/openmaic-homepage.html
             dist/acceptance-result.json
             dist/OpenMAIC-Windows-x64/build-manifest.json
+            dist/portable-runtime-diagnostics.json
             ${{ runner.temp }}/openmaic-windows-acceptance.stdout.log
             ${{ runner.temp }}/openmaic-windows-acceptance.stderr.log
             ${{ runner.temp }}/openmaic-screenshot.stdout.log
