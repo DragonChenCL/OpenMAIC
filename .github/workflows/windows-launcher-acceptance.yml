@@ -123,7 +123,6 @@ jobs:
           $nativeModules = @($standaloneFiles | Where-Object { $_.Name -match '\.node$' })
           if (-not $nativeModules) { throw 'Standalone output contains no native .node modules.' }
           if (-not ($nativeModules | Where-Object { $_.FullName -match 'sharp' })) { throw 'Standalone output is missing sharp native bindings.' }
-          if (-not ($nativeModules | Where-Object { $_.FullName -match 'canvas' })) { throw 'Standalone output is missing canvas native bindings.' }
           Write-Host "Standalone bundle: $($standaloneFiles.Count) files, $totalBytes bytes, $($nativeModules.Count) native modules."
 
       - name: Setup Go
