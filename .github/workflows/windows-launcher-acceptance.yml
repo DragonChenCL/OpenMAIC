@@ -156,12 +156,15 @@ jobs:
           Copy-Item (Join-Path $source '.next/standalone/*') $runtime -Recurse -Force
           New-Item -ItemType Directory -Path (Join-Path $runtime '.next/static') -Force | Out-Null
           Copy-Item (Join-Path $source '.next/static/*') (Join-Path $runtime '.next/static') -Recurse -Force
-          $swcHelpersSource = (& node -e 'const fs=require("node:fs");const path=require("node:path");const nextPkg=require.resolve("next/package.json");const entry=require.resolve("@swc/helpers/_/_interop_require_default",{paths:[path.dirname(nextPkg)]});process.stdout.write(path.dirname(path.dirname(fs.realpathSync(entry))))').Trim()
+          $swcResolution = (& node -e 'const fs=require("node:fs");const path=require("node:path");const nextPkg=require.resolve("next/package.json");const entry=fs.realpathSync(require.resolve("@swc/helpers/_/_interop_require_default",{paths:[path.dirname(nextPkg)]}));const root=path.resolve(path.dirname(entry),"..");process.stdout.write(JSON.stringify({root,relative:path.relative(root,entry)}))' | ConvertFrom-Json)
+          $swcHelpersSource = $swcResolution.root
           $swcHelpersDestination = Join-Path $runtime 'node_modules/@swc/helpers'
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $swcHelpersSource '_/_interop_require_default.js'))) { throw "Could not resolve Next.js runtime @swc/helpers package: $swcHelpersSource" }
+          $swcSourceEntry = Join-Path $swcHelpersSource $swcResolution.relative
+          $swcDestinationEntry = Join-Path $swcHelpersDestination $swcResolution.relative
+          if (-not (Test-Path $swcSourceEntry)) { throw "Resolved Next.js @swc/helpers entry missing: $swcSourceEntry" }
           New-Item -ItemType Directory -Path (Split-Path $swcHelpersDestination -Parent) -Force | Out-Null
           & node -e "require('node:fs').cpSync(process.argv[1],process.argv[2],{recursive:true,dereference:true})" $swcHelpersSource $swcHelpersDestination
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $swcHelpersDestination '_/_interop_require_default.js'))) { throw 'Could not bundle required @swc/helpers runtime files.' }
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $swcDestinationEntry)) { throw "Could not bundle resolved @swc/helpers entry: $swcDestinationEntry" }
           if (Test-Path (Join-Path $source 'public')) {
             Copy-Item (Join-Path $source 'public') $runtime -Recurse -Force
           }
